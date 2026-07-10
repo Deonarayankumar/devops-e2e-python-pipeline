@@ -1,0 +1,64 @@
+trigger:
+  branches:
+    include: [main]
+
+variables:
+  pythonVersion: '3.11'
+  imageRepository: order-api
+  containerRegistry: demoregistry.azurecr.io
+  sonarProjectKey: devops-e2e-python-pipeline
+
+stages:
+  - stage: Build
+    jobs:
+      - job: TestAndScan
+        pool:
+          vmImage: ubuntu-latest
+        steps:
+          - task: UsePythonVersion@0
+            inputs:
+              versionSpec: $(pythonVersion)
+          - script: |
+              cd services/api
+              pip install -e ".[dev]"
+              pytest -v --junitxml=$(Build.ArtifactStagingDirectory)/junit.xml
+            displayName: Run API tests
+          - task: PublishTestResults@2
+            inputs:
+              testResultsFiles: '$(Build.ArtifactStagingDirectory)/junit.xml'
+          - script: sonar-scanner -Dsonar.projectKey=$(sonarProjectKey)
+            displayName: SonarQube scan
+          - task: Docker@2
+            displayName: Build API image
+            inputs:
+              command: build
+              Dockerfile: services/api/Dockerfile
+              buildContext: services/api
+              tags: |
+                $(Build.BuildId)
+          - script: ./scripts/trivy-scan.sh $(containerRegistry)/$(imageRepository):$(Build.BuildId)
+            displayName: Trivy scan
+
+  - stage: DeployStaging
+    dependsOn: Build
+    jobs:
+      - deployment: Staging
+        environment: staging
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - script: ./scripts/smoke-test.sh $(STAGING_URL)
+                  displayName: Smoke test staging
+
+  - stage: DeployProduction
+    dependsOn: DeployStaging
+    jobs:
+      - deployment: Production
+        environment: production
+        strategy:
+          runOnce:
+            deploy:
+              steps:
+                - script: ./scripts/jfrog-promote.sh --artifact order-api --version $(Build.BuildId) --from docker-local --to docker-release
+                  displayName: Promote artifact
