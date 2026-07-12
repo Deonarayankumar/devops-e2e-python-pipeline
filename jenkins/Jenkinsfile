@@ -1,0 +1,77 @@
+@Library('devops-shared-library') _
+
+pipeline {
+    agent any
+    environment {
+        REGISTRY = 'demo.jfrog.io/docker-local'
+        IMAGE_API = "${REGISTRY}/order-api"
+        IMAGE_WORKER = "${REGISTRY}/order-worker"
+        SONAR_PROJECT = 'devops-e2e-python-pipeline'
+    }
+    stages {
+        stage('Checkout') {
+            steps { checkout scm }
+        }
+        stage('Test API') {
+            steps {
+                dir('services/api') {
+                    sh 'pip install -e ".[dev]" && pytest -v --junitxml=../../reports/junit-api.xml'
+                }
+            }
+        }
+        stage('SonarQube') {
+            steps {
+                withSonarQubeEnv('SonarQube') {
+                    sh 'sonar-scanner -Dsonar.projectKey=${SONAR_PROJECT}'
+                }
+            }
+        }
+        stage('Build Images') {
+            parallel {
+                stage('API') {
+                    steps {
+                        sh "docker build -t ${IMAGE_API}:${BUILD_NUMBER} services/api"
+                    }
+                }
+                stage('Worker') {
+                    steps {
+                        sh "docker build -t ${IMAGE_WORKER}:${BUILD_NUMBER} services/worker"
+                    }
+                }
+            }
+        }
+        stage('Trivy Scan') {
+            steps {
+                sh './scripts/trivy-scan.sh ${IMAGE_API}:${BUILD_NUMBER}'
+            }
+        }
+        stage('Push') {
+            steps {
+                sh "docker push ${IMAGE_API}:${BUILD_NUMBER}"
+                sh "docker push ${IMAGE_WORKER}:${BUILD_NUMBER}"
+            }
+        }
+        stage('Promote') {
+            when { branch 'main' }
+            steps {
+                promoteArtifact(
+                    artifact: "order-api",
+                    version: "${BUILD_NUMBER}",
+                    fromRepo: 'docker-local',
+                    toRepo: 'docker-release'
+                )
+            }
+        }
+        stage('Smoke Test') {
+            steps {
+                sh './scripts/smoke-test.sh http://staging.example.com'
+            }
+        }
+    }
+    post {
+        always {
+            junit 'reports/*.xml'
+            archiveArtifacts artifacts: 'reports/**', allowEmptyArchive: true
+        }
+    }
+}
